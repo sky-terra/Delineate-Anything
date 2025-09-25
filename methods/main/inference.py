@@ -16,6 +16,7 @@ from osgeo import gdal, osr, ogr
 import shutil
 import math
 import torch
+from copy import deepcopy
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,69 +41,101 @@ def execute(model_paths, config, verbose):
     )
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    logger.info("Device:", device)
+    logger.info(f"Device: {device}")
 
-    time_start = time.time()  # Initialize time_start for execution time tracking
+    time_start = time.time()
 
-    # Ensure the output folder exists
+    # Load models once
+    logger.info("Loading the model(s)...")
+    loaded_models = []
+    for model_path in model_paths:
+        model = YOLO(model_path).to(device)
+        loaded_models.append(model)
+
+    model_names = config["model"]
+    models_map = {model_names[i]: loaded_models[i] for i in range(len(model_names))}
+
     create_output_folder(temp_folder)
     create_output_folder(os.path.dirname(output_path))
 
-    tiffs = [os.path.join(src_folder, file) for file in os.listdir(src_folder) if (file.endswith(".tif") or file.endswith(".tiff"))]
-    analyser = DataAnalyser(tiffs, config["data_loader"]["bands"], config["super_resolution"])
-    if not analyser.isCompatible():
-        logger.error(f"Incompatible tiff files. Ensure the same projection and pixel size fo each file in the folder.")
+    all_tiffs = [os.path.join(src_folder, file) for file in os.listdir(src_folder) if (file.endswith(".tif") or file.endswith(".tiff"))]
+
+    # Group TIFFs by CRS
+    crs_groups = {}
+    for tiff_path in all_tiffs:
+        try:
+            ds = gdal.Open(tiff_path)
+            if ds is None:
+                logger.warning(f"Could not open {tiff_path}. Skipping.")
+                continue
+            proj = ds.GetProjection()
+            if proj not in crs_groups:
+                crs_groups[proj] = []
+            crs_groups[proj].append(tiff_path)
+            ds = None
+        except Exception as e:
+            logger.error(f"Error reading CRS from {tiff_path}: {e}")
+
+    output_basename, output_ext = os.path.splitext(output_path)
+    group_index = 1
+
+    if not crs_groups:
+        logger.warning("No valid TIFF files found in the input directory.")
         return
 
-    logger.info("Estimating normalization bounds...")
-    analyser.calcNormalizationBounds()
+    for crs, tiffs in crs_groups.items():
+        logger.info(f"Processing group {group_index}/{len(crs_groups)}: {len(tiffs)} TIFFs with the same CRS.")
 
-    config["data_loader"]["min"] = analyser.min
-    config["data_loader"]["max"] = analyser.max
+        analyser = DataAnalyser(tiffs, config["data_loader"]["bands"], config["super_resolution"])
+        if not analyser.isCompatible():
+            logger.error(f"Incompatible tiff files in a group. This should not happen. Skipping group.")
+            continue
 
-    planner = ExecutionPlanner(analyser, config["execution_planner"])
+        logger.info("Estimating normalization bounds...")
+        analyser.calcNormalizationBounds()
 
-    logger.info("Loading the model...")
-    models = []
-    for model_path in model_paths:
-        model = YOLO(model_path).to(device)
-        models.append(model)
+        current_config = deepcopy(config)
+        current_config["data_loader"]["min"] = analyser.min
+        current_config["data_loader"]["max"] = analyser.max
 
-    model_names = config["model"]
-    models = {model_names[i]: models[i] for i in range(len(model_names))}
+        planner = ExecutionPlanner(analyser, current_config["execution_planner"])
 
-    lclu_mask_path = warp_lclu(mask_filepath, os.path.join(temp_folder, os.path.basename(src_folder) + ".lclu.tif"), 
-                               tiffs[0], analyser.total_bounds, [analyser.pixel_size_x, analyser.pixel_size_y], 
-                               ["BIGTIFF=YES", "COMPRESS=ZSTD", "ZSTD_LEVEL=2", "TILED=YES", "NUM_THREADS=ALL_CPUS"])
+        lclu_mask_path = warp_lclu(mask_filepath, os.path.join(temp_folder, os.path.basename(src_folder) + f"_{group_index}.lclu.tif"),
+                                   tiffs[0], analyser.total_bounds, [analyser.pixel_size_x, analyser.pixel_size_y],
+                                   ["BIGTIFF=YES", "COMPRESS=ZSTD", "ZSTD_LEVEL=2", "TILED=YES", "NUM_THREADS=ALL_CPUS"])
 
-    gpkg_path, layer_name = create_geopackage_with_same_projection(
-            output_path, config["polygonization_args"]["layer_name"], analyser.projection,
-            override_if_exists=config["polygonization_args"]["override_if_exists"]
-        )
+        # Modify output path for each group
+        current_output_path = f"{output_basename}_{group_index}{output_ext}" if len(crs_groups) > 1 else output_path
 
-    time_delineate_start = time.time()
-    logger.info("Starting delineation...")
-    execute_delineation(models, planner, config["postprocess_limits"], config["passes"], config["data_loader"], 
-                        (gpkg_path, layer_name), lclu_mask_path, config["mask_info"], config)
-    
-    logger.info(f"All regions have been delineated in {time.time() - time_delineate_start:.2f} seconds.")
+        gpkg_path, layer_name = create_geopackage_with_same_projection(
+                current_output_path, current_config["polygonization_args"]["layer_name"], analyser.projection,
+                override_if_exists=current_config["polygonization_args"]["override_if_exists"]
+            )
 
-    postdelineation_merge((gpkg_path, layer_name), config["filtering_args"])
+        time_delineate_start = time.time()
+        logger.info(f"Starting delineation for group {group_index}...")
+        execute_delineation(models_map, planner, current_config["postprocess_limits"], current_config["passes"], current_config["data_loader"],
+                            (gpkg_path, layer_name), lclu_mask_path, current_config["mask_info"], current_config, device)
+
+        logger.info(f"Group {group_index} delineated in {time.time() - time_delineate_start:.2f} seconds.")
+
+        postdelineation_merge((gpkg_path, layer_name), current_config["filtering_args"])
+
+        group_index += 1
 
     if not keep_temp:
         folder_content = os.listdir(temp_folder)
         for file in folder_content:
-            if file.startswith(os.path.basename(src_folder) + "."):
-                os.remove(os.path.join(temp_folder, file))
+            if os.path.basename(src_folder) in file and ".lclu.tif" in file:
+                 os.remove(os.path.join(temp_folder, file))
 
-        if len(os.listdir(temp_folder)) == 0:
+        if not os.listdir(temp_folder):
             shutil.rmtree(temp_folder)
-
         logger.info("Temporary files have been deleted.")
-    
+
     logger.info(f"Execution finished in {time.time() - time_start:.2f} seconds.")
 
-def execute_delineation(models, planner, postproc_config, passes, dataloader_config, layer_info, lclu_path, lclu_config, full_config):
+def execute_delineation(models, planner, postproc_config, passes, dataloader_config, layer_info, lclu_path, lclu_config, full_config, device):
     gpkg = ogr.Open(layer_info[0], 1)
     out_layer = gpkg.GetLayerByName(layer_info[1])
     srs = out_layer.GetSpatialRef()
@@ -152,7 +185,6 @@ def execute_delineation(models, planner, postproc_config, passes, dataloader_con
 
                         if images_batch is None:
                             break
-
                         model_results = []
                         for model_args in pass_args["model_args"]:
                             model = models[model_args["name"]]
@@ -176,6 +208,9 @@ def execute_delineation(models, planner, postproc_config, passes, dataloader_con
 
                             args = ([results[i].cpu() for results in model_results], nodata_batch[i], bounds_batch[i], id_counter)
                             postproc_handler.put(args)
+                        
+                        if device == 'cuda':
+                            torch.cuda.empty_cache()
 
                     postproc_handler.sync()
 

@@ -5,6 +5,7 @@ data_root: data/images
 output_root: data/delineated
 temp_root: data/temp
 keep_temp: false
+overwrite_existing: false
 mask_root: data/masks
 
 # null if use all subfolders or exclude is not null

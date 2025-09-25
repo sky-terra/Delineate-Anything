@@ -31,26 +31,20 @@ def delineate(args, verbose):
         }
     }
 
-    model_names =  args["config"]["model"]
+    model_names = args["config"]["model"]
     if isinstance(model_names, str):
-        model_name = model_names
+        model_names = [model_names]
+        args["config"]["model"] = model_names
+
+    model_paths = []
+    for model_name in model_names:
         if model_name in models_dict:
-            model_path = hf_hub_download(repo_id=models_dict[model_name]["repo_id"], filename=models_dict[model_name]["filename"])
+            model_paths.append(hf_hub_download(repo_id=models_dict[model_name]["repo_id"], filename=models_dict[model_name]["filename"]))
         else:
             if os.path.exists(model_name):
-                model_path = model_name
+                model_paths.append(model_name)
             else:
                 raise ValueError(f"Unknown model '{model_name}' in configuration file.")
-    else:
-        model_path = []
-        for model_name in model_names:
-            if model_name in models_dict:
-                model_path.append(hf_hub_download(repo_id=models_dict[model_name]["repo_id"], filename=models_dict[model_name]["filename"]))
-            else:
-                if os.path.exists(model_name):
-                    model_path.append(model_name)
-                else:
-                    raise ValueError(f"Unknown model '{model_name}' in configuration file.")
 
     # loading delineation method
     method = args["config"]["method"]
@@ -64,7 +58,7 @@ def delineate(args, verbose):
         "mask_filepath": args["mask"]
     }
 
-    module.execute(model_path, args["config"], verbose)
+    module.execute(model_paths, args["config"], verbose)
 
 def deep_override(a, b):
     """Recursively write dict b into dict a and return the result."""
@@ -110,6 +104,11 @@ def batch_routine(args):
         if "exclude" in batch_config and batch_config["exclude"] and folder in batch_config["exclude"]:
             logger.warning(f"{folder} is present in exclude list. Skipped.")
             continue
+        
+        output_path = os.path.join(batch_config["output_root"], folder + ".gpkg")
+        if not batch_config.get("overwrite_existing", False) and os.path.exists(output_path):
+            logger.info(f"Output for {folder} already exists at {output_path}. Skipping.")
+            continue
 
         config = deepcopy(base_config)
         mask_path = os.path.join(batch_config["mask_root"], folder + ".tif")
@@ -122,7 +121,7 @@ def batch_routine(args):
 
             # load overrided config file
             if "config" in override:
-                config = yaml.safe_load(Path(override["config"].read_text()))
+                config = yaml.safe_load(Path(override["config"]).read_text())
 
             # make changes to currently used config file
             if "config_override" in override and override["config_override"]:
@@ -136,7 +135,7 @@ def batch_routine(args):
             "name": folder,
             "config": config,
             "input": os.path.join(batch_config["data_root"], folder),
-            "output": os.path.join(batch_config["output_root"], folder + ".gpkg"),
+            "output": output_path,
             "temp": batch_config["temp_root"],
             "keep_temp": batch_config["keep_temp"],
             "mask": mask_path
